@@ -1,0 +1,110 @@
+from fastapi import FastAPI, Depends, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, EmailStr
+import requests
+import math
+from datetime import datetime
+
+from database import get_db, init_db
+from models import User, Analysis
+from auth import hash_password, verify_password, create_access_token, get_current_user
+
+app = FastAPI(title="AI Sports Intelligence API", version="2.0")
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+API_KEY = "SUA_CHAVE_AQUI"
+BASE_URL = "https://v3.football.api-sports.io"
+HEADERS = {"x-apisports-key": API_KEY}
+
+class UserRegister(BaseModel):
+name: str
+email: EmailStr
+password: str
+
+class UserLogin(BaseModel):
+email: EmailStr
+password: str
+
+class TokenResponse(BaseModel):
+access_token: str
+token_type: str = "bearer"
+user: dict
+
+def poisson_prob(lmbda, k):
+return (lmbda ** k * math.exp(-lmbda)) / math.factorial(k)
+
+def over_under_prob(media_casa, media_fora, limite=2.5):
+lambda_total = media_casa + media_fora
+prob_under = sum(poisson_prob(lambda_total, k) for k in range(int(limite) + 1))
+return {"over": round((1 - prob_under) * 100, 1), "under": round(prob_under * 100, 1), "lambda": round(lambda_total, 2)}
+
+def btts_prob(media_casa, media_fora):
+prob_casa = 1 - poisson_prob(media_casa, 0)
+prob_fora = 1 - poisson_prob(media_fora, 0)
+prob = prob_casa * prob_fora
+return {"btts_yes": round(prob * 100, 1), "btts_no": round((1 - prob) * 100, 1)}
+
+def expected_corners(media_casa, media_fora):
+total = media_casa + media_fora
+prob_over = 1 - sum(poisson_prob(total, k) for k in range(10))
+return {"total_esperado": round(total, 1), "over_95": round(prob_over * 100, 1)}
+
+@app.post("/api/register")
+async def register(user_data: UserRegister, db: Session = Depends(get_db)):
+existing = db.query(User).filter(User.email == user_data.email).first()
+if existing:
+raise HTTPException(status_code=400, detail="Email ja cadastrado.")
+user = User(name=user_data.name, email=user_data.email, password_hash=hash_password(user_data.password))
+db.add(user)
+db.commit()
+db.refresh(user)
+token = create_access_token({"user_id": user.id, "email": user.email})
+return {"access_token": token, "token_type": "bearer", "user": {"id": user.id, "name": user.name, "email": user.email}}
+
+@app.post("/api/login")
+async def login(user_data: UserLogin, db: Session = Depends(get_db)):
+user = db.query(User).filter(User.email == user_data.email).first()
+if not user or not verify_password(user_data.password, user.password_hash):
+raise HTTPException(status_code=401, detail="Email ou senha incorretos.")
+token = create_access_token({"user_id": user.id, "email": user.email})
+return {"access_token": token, "token_type": "bearer", "user": {"id": user.id, "name": user.name, "email": user.email}}
+
+@app.get("/api/me")
+async def get_profile(current_user: User = Depends(get_current_user)):
+return {"id": current_user.id, "name": current_user.name, "email": current_user.email}
+
+@app.get("/api/jogos")
+async def listar_jogos(current_user: User = Depends(get_current_user)):
+hoje = datetime.now().strftime("%Y-%m-%d")
+try:
+resp = requests.get(f"{BASE_URL}/fixtures?date={hoje}&season=2024", headers=HEADERS)
+data = resp.json()
+jogos = []
+for j in data.get("response", [])[:10]:
+jogos.append({"id": j["fixture"]["id"], "casa": j["teams"]["home"]["name"], "fora": j["teams"]["away"]["name"], "liga": j["league"]["name"]})
+return {"jogos": jogos}
+except:
+return {"jogos": [{"id":1,"casa":"Man City","fora":"Arsenal","liga":"Premier"},{"id":2,"casa":"Real Madrid","fora":"Barcelona","liga":"La Liga"}]}
+
+@app.get("/api/analisar")
+async def analisar_jogo(time_casa: str = Query(...), time_fora: str = Query(...), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+media_casa=1.62; media_fora=1.21
+over_under = over_under_prob(media_casa, media_fora)
+btts = btts_prob(media_casa, media_fora)
+corners = expected_corners(5.4, 4.3)
+resultado = {"jogo":f"{time_casa} vs {time_fora}","over_under":over_under,"btts":btts,"corners":corners,"modelo":"Poisson"}
+analise = Analysis(user_id=current_user.id,match_name=resultado["jogo"],over_prob=over_under["over"],under_prob=over_under["under"],btts_yes_prob=btts["btts_yes"],btts_no_prob=btts["btts_no"],corners_total=corners["total_esperado"],corners_over_95=corners["over_95"],lambda_goals=over_under["lambda"],model_used="Poisson")
+db.add(analise)
+db.commit()
+return resultado
+
+@app.get("/api/historico")
+async def get_historico(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+analyses = db.query(Analysis).filter(Analysis.user_id == current_user.id).order_by(Analysis.created_at.desc()).limit(20).all()
+return {"historico":[{"jogo":a.match_name,"over":a.over_prob,"btts_yes":a.btts_yes_prob,"data":a.created_at.isoformat()} for a in analyses]}
+
+@app.on_event("startup")
+async def startup():
+init_db()
