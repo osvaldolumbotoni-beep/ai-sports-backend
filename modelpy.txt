@@ -1,0 +1,29 @@
+from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean
+from sqlalchemy.sql import func
+from database import Base
+
+class User(Base):
+tablename = "users"
+
+id = Column(Integer, primary_key=True, autoincrement=True)
+name = Column(String(100), nullable=False)
+email = Column(String(150), unique=True, nullable=False, index=True)
+password_hash = Column(String(255), nullable=False)
+is_vip = Column(Boolean, default=False)
+created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Analysis(Base):
+tablename = "analyses"
+
+id = Column(Integer, primary_key=True, autoincrement=True)
+user_id = Column(Integer, nullable=False, index=True)
+match_name = Column(String(200), nullable=False)
+over_prob = Column(Float)
+under_prob = Column(Float)
+btts_yes_prob = Column(Float)
+btts_no_prob = Column(Float)
+corners_total = Column(Float)
+corners_over_95 = Column(Float)
+lambda_goals = Column(Float)
+model_used = Column(String(50))
+created_at = Column(DateTime(timezone=True), server_default=func.now())
